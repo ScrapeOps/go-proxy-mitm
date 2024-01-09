@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -211,6 +213,13 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 			}
 		}
 		go func() {
+
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("Recovered from panic in go-proxy-mitm https.go: %v \n%s", r, debug.Stack())
+				}
+			}()
+
 			//TODO: cache connections to the remote website
 			rawClientTls := tls.Server(proxyClient, tlsConfig)
 			if err := rawClientTls.Handshake(); err != nil {
@@ -242,6 +251,7 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 
 				req, resp := proxy.filterRequest(req, ctx)
 				if resp == nil {
+
 					if isWebSocketRequest(req) {
 						ctx.Logf("Request looks like websocket upgrade.")
 						proxy.serveWebsocketTLS(ctx, w, req, tlsConfig, rawClientTls)
@@ -271,6 +281,23 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				resp = proxy.filterResponse(resp, ctx)
 				defer resp.Body.Close()
 
+				//catch if we get a response with no header and set one
+				if resp.Request == nil {
+					println("***** Internal Error: Issue connecting to proxy provider - probabaly due to authentication issue")
+
+					//setting a default error message here
+					errorMessage := "An error occurred. Please contact ScrapeOps support."
+					resp.Body = ioutil.NopCloser(strings.NewReader(errorMessage))
+
+					//just making a fake request here to enable an error response to be set
+					newReq := &http.Request{
+						// StatusCode: http.StatusInternalServerError, // Or another appropriate status code
+						Body:   ioutil.NopCloser(strings.NewReader("")),
+						Header: make(http.Header),
+					}
+					resp.Request = newReq
+				}
+
 				text := resp.Status
 				statusCode := strconv.Itoa(resp.StatusCode) + " "
 				if strings.HasPrefix(text, statusCode) {
@@ -287,9 +314,11 @@ func (proxy *ProxyHttpServer) handleHttps(w http.ResponseWriter, r *http.Request
 				} else {
 					// Since we don't know the length of resp, return chunked encoded response
 					// TODO: use a more reasonable scheme
+
 					resp.Header.Del("Content-Length")
 					resp.Header.Set("Transfer-Encoding", "chunked")
 				}
+
 				// Force connection close otherwise chrome will keep CONNECT tunnel open forever
 				resp.Header.Set("Connection", "close")
 				if err := resp.Header.Write(rawClientTls); err != nil {
